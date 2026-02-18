@@ -1,0 +1,1654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>NutriSense Pro AI Health System</title>
+    <script src="https://cdn.tailwindcss.com?plugins=typography"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet" />
+    <style>
+        *{
+            align-content: center;
+            align-items: center;
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fb; /* Light background */
+            align-content: center;
+            align-items: center;
+        }
+        .content-card {
+            background-color: #ffffff;
+            border: 1px solid #e2e8f0;
+        }
+        .scroll-container {
+            max-height: calc(100vh - 8rem); 
+            overflow-y: auto;
+            
+        }
+        .file-upload-box {
+            border: 2px dashed #34d399;
+            background-color: #f0fff4;
+            transition: all 0.3s;
+        }
+        .file-upload-box:hover {
+            background-color: #d1fae5;
+        }
+        /* Custom scrollbar for better appearance */
+        .scroll-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        .scroll-container::-webkit-scrollbar-thumb {
+            background-color: #99f6e4;
+            border-radius: 10px;
+        }
+        .animate-fade-in {
+            animation: fadeIn 0.5s ease-in-out;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        /* Chat bubble specific overrides */
+        .prose p {
+            margin-bottom: 0.5em;
+            margin-top: 0.5em;
+        }
+        .prose ul {
+            margin-bottom: 0.5em;
+            margin-top: 0.5em;
+        }
+        .prose li {
+            margin-top: 0.2em;
+            margin-bottom: 0.2em;
+        }
+        .prose *:first-child {
+            margin-top: 0;
+        }
+        .prose *:last-child {
+            margin-bottom: 0;
+        }
+        .completed-reminder {
+            text-decoration: line-through;
+            color: #9ca3af; /* Gray text for completed items */
+        }
+    </style>
+</head>
+<body class="min-h-screen antialiased">
+
+    <script type="module">
+        // Firebase Imports
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        setLogLevel('silent'); // Disable Firestore logging to keep console clean
+
+        // --- GLOBAL VARIABLES ---
+        const apiKey = "AIzaSyDoxe0rKcuEnshZwlIGfiRjbtcB0me2hjM"; // API Key injected by environment
+        const API_URL_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
+        const MODEL = 'gemini-2.5-flash-preview-09-2025';
+        const APP_COLLECTION = 'nutrisense-pro';
+
+        let app, db, auth;
+        let userId = null;
+        let isAuthReady = false;
+        let useLocalStorage = false;
+
+        // Configure Marked options for safety and breaks
+        if (typeof marked !== 'undefined') {
+            marked.use({
+                breaks: true,
+                gfm: true
+            });
+        }
+
+        const state = {
+            currentView: 'profile',
+            userData: {
+                profile: null,
+                mealLog: [],
+                deficiencyAnalysis: null,
+                routine: null, // Stores user routine data
+                reminders: [], // Stores user reminders
+            },
+            chatHistory: [],
+            visionResult: null,
+            mealPlan: null,
+            isChatLoading: false, // Tracks chatbot loading state
+        };
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // File -> Base64
+        const fileToBase64 = (file) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.readAsDataURL(file);
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = error => reject(error);
+            });
+        };
+
+        // Helper: Clean and Parse JSON (Handles Markdown and Loops)
+        const cleanAndParseJSON = (text) => {
+            try {
+                // Remove markdown fences
+                let cleaned = text.replace(/```json\n?|```/g, '').trim();
+                // Find first '{' and last '}' to handle potential extra text
+                const firstBrace = cleaned.indexOf('{');
+                const lastBrace = cleaned.lastIndexOf('}');
+                if (firstBrace !== -1 && lastBrace !== -1) {
+                    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+                }
+                return JSON.parse(cleaned);
+            } catch (e) {
+                console.error("JSON Parse Error:", e);
+                console.log("Raw Text:", text);
+                return null;
+            }
+        };
+
+        // Firestore doc ref builder
+        const getFireStoreDocRef = (docId = 'userData') => {
+            if (useLocalStorage || !db || !userId) return null;
+            return doc(db, `artifacts/${appId}/users/${userId}/${APP_COLLECTION}/${docId}`);
+        };
+
+        const initializeFirebase = async () => {
+            if (!firebaseConfig) {
+                console.warn("Firebase config is missing. Switching to Offline Mode (Local Storage).");
+                useLocalStorage = true;
+                isAuthReady = true;
+                userId = 'offline_user';
+                attachDataListener();
+                return;
+            }
+
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        attachDataListener();
+                    } else {
+                        if (!userId) {
+                            if (initialAuthToken) {
+                                await signInWithCustomToken(auth, initialAuthToken);
+                            } else {
+                                await signInAnonymously(auth);
+                            }
+                        }
+                    }
+                });
+
+                if (!auth.currentUser) {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                }
+            } catch (error) {
+                console.error("Error initializing Firebase:", error);
+                useLocalStorage = true;
+                isAuthReady = true;
+                userId = 'offline_user';
+                attachDataListener();
+            }
+        };
+
+        const attachDataListener = () => {
+            if (useLocalStorage) {
+                try {
+                    const savedData = localStorage.getItem('nutrisense_data');
+                    if (savedData) {
+                        const data = JSON.parse(savedData);
+                        state.userData.profile = data.profile || state.userData.profile;
+                        state.userData.mealLog = data.mealLog || state.userData.mealLog;
+                        state.userData.deficiencyAnalysis = data.deficiencyAnalysis || state.userData.deficiencyAnalysis;
+                        state.userData.routine = data.routine || state.userData.routine;
+                        state.userData.reminders = data.reminders || state.userData.reminders;
+                        console.log("Data loaded from Local Storage");
+                    }
+                } catch (e) {
+                    console.error("Error reading local storage:", e);
+                }
+                updateUI();
+                return;
+            }
+
+            if (!isAuthReady || !userId) return;
+            const userDocRef = getFireStoreDocRef();
+            if (!userDocRef) return;
+
+            onSnapshot(userDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    state.userData.profile = data.profile || state.userData.profile;
+                    state.userData.mealLog = data.mealLog || state.userData.mealLog;
+                    state.userData.deficiencyAnalysis = data.deficiencyAnalysis || state.userData.deficiencyAnalysis;
+                    state.userData.routine = data.routine || state.userData.routine;
+                    state.userData.reminders = data.reminders || state.userData.reminders;
+                    console.log("Data updated from Firestore");
+                }
+                updateUI();
+            }, (error) => {
+                console.error("Error listening to Firestore changes:", error);
+            });
+        };
+
+        // Save user data (local or firestore)
+        const saveUserData = async (data) => {
+            if (useLocalStorage) {
+                try {
+                    const currentData = JSON.parse(localStorage.getItem('nutrisense_data') || '{}');
+                    const newData = {
+                        ...currentData,
+                        ...data,
+                        profile: data.profile || currentData.profile,
+                        mealLog: data.mealLog || currentData.mealLog,
+                        deficiencyAnalysis: data.deficiencyAnalysis || currentData.deficiencyAnalysis,
+                        routine: data.routine || currentData.routine,
+                        reminders: data.reminders || currentData.reminders
+                    };
+                    localStorage.setItem('nutrisense_data', JSON.stringify(newData));
+                    return true;
+                } catch (e) {
+                    console.error("Local Save Error:", e);
+                    showModal('Error', 'Failed to save to local storage.');
+                    return false;
+                }
+            }
+
+            const userDocRef = getFireStoreDocRef();
+            if (!userDocRef) {
+                console.error("Cannot save: Firestore connecting...");
+                showModal('Please Wait', 'The system is connecting to the cloud. Please wait a moment and try again.');
+                return false;
+            }
+
+            try {
+                await setDoc(userDocRef, data, { merge: true });
+                return true;
+            } catch (error) {
+                console.error("Error saving data:", error);
+                showModal('Error', `Failed to save data: ${error.message}`);
+                return false;
+            }
+        };
+
+        const saveProfile = async (profileData) => {
+            const TDEE = calculateTDEE(
+                parseFloat(profileData.weightKg),
+                parseFloat(profileData.heightCm),
+                parseInt(profileData.age, 10),
+                profileData.gender
+            );
+
+            const profileToSave = {
+                ...profileData,
+                TDEE,
+                calorieGoal: TDEE - 500,
+            };
+
+            if (await saveUserData({ profile: profileToSave })) {
+                state.userData.profile = profileToSave;
+                showModal('Success', `Profile saved! Your daily calorie goal is ${profileToSave.calorieGoal} kcal.`);
+                updateUI();
+            }
+        };
+
+        // NEW: Save Routine Function
+        const saveRoutine = async (routineData) => {
+            if (await saveUserData({ routine: routineData })) {
+                state.userData.routine = routineData;
+                showModal('Success', 'Daily routine saved successfully!');
+                updateUI();
+            }
+        };
+
+        const logMeal = async (mealData) => {
+            const newLog = {
+                ...mealData,
+                date: new Date().toISOString(),
+                calories: parseFloat(mealData.calories || 0),
+                carbs: parseFloat(mealData.carbs || 0),
+                protein: parseFloat(mealData.protein || 0),
+                fat: parseFloat(mealData.fat || 0),
+            };
+
+            const newMealLog = [...state.userData.mealLog, newLog];
+
+            if (await saveUserData({ mealLog: newMealLog })) {
+                state.userData.mealLog = newMealLog;
+                showModal('Success', 'Meal logged successfully!');
+                updateUI();
+            }
+        };
+        
+        // Reminder functions
+        const saveReminders = async (newReminders) => {
+             if (await saveUserData({ reminders: newReminders })) {
+                state.userData.reminders = newReminders;
+                updateUI();
+                return true;
+            }
+            return false;
+        };
+
+        const addReminder = async (reminderData) => {
+            const newReminder = {
+                id: Date.now(),
+                ...reminderData,
+                isCompleted: false,
+                date: reminderData.date, // ISO date string from input
+                createdAt: new Date().toISOString()
+            };
+
+            const newReminders = [...state.userData.reminders, newReminder];
+            if (await saveReminders(newReminders)) {
+                showModal('Scheduled!', `Reminder "${reminderData.title}" has been scheduled.`);
+                document.getElementById('reminder-form').reset();
+            }
+        };
+
+        const toggleReminderCompletion = async (id) => {
+            const newReminders = state.userData.reminders.map(r => {
+                if (r.id === id) {
+                    return { ...r, isCompleted: !r.isCompleted };
+                }
+                return r;
+            });
+
+            await saveReminders(newReminders);
+        };
+
+        const calculateTDEE = (weightKg, heightCm, age, gender) => {
+            let bmr;
+            if (gender === 'Male') {
+                bmr = (10 * weightKg) + (6.25 * heightCm) - (5 * age) + 5;
+            } else {
+                bmr = (10 * weightKg) + (6.25 * heightCm) - (5 * age) - 161;
+            }
+            return Math.round(bmr * 1.55);
+        };
+
+        // Exponential backoff fetch
+        const exponentialBackoffFetch = async (url, options, maxRetries = 5) => {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (!response.ok) {
+                        if (response.status === 401) throw new Error(`HTTP error! status: 401 (Unauthorized)`);
+                        if (response.status !== 429) throw new Error(`HTTP error! status: ${response.status}`);
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                    return response;
+                } catch (error) {
+                    if (i === maxRetries - 1 || (error.message && error.message.includes('401'))) throw error;
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+            throw new Error("Failed to fetch after maximum retries.");
+        };
+
+        // Vision analysis
+        const analyzeMealImage = async (base64Image, mimeType, description) => {
+            const loadingIndicator = document.getElementById('vision-loading');
+            if (loadingIndicator) loadingIndicator.classList.remove('hidden');
+            state.visionResult = null;
+            const out = document.getElementById('vision-output');
+            if (out) out.innerHTML = '';
+
+            const profile = state.userData.profile;
+            const profileDetails = profile ? `User Goal: ${profile.calorieGoal} kcal. Current intake details: Age: ${profile.age}, Weight: ${profile.weightKg}kg, Gender: ${profile.gender}.` : 'No profile data.';
+
+            const systemPrompt = "You are a highly accurate Computer Vision and Nutritional AI. Analyze the uploaded image, identify the food items, and provide a volumetric estimate of the calories and macronutrients for the meal shown. If you are unsure, provide a reasonable estimate and state the assumptions. Return ONLY the requested JSON structure.";
+
+            const userQuery = `Analyze this meal photo. I describe it as: "${description}". Based on standard volumetric data, estimate the total calories, protein, carbs, and fat. ${profileDetails}`;
+
+            const payload = {
+                contents: [{
+                    parts: [
+                        { text: userQuery },
+                        { inlineData: { mimeType, data: base64Image } }
+                    ]
+                }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            "mealName": { "type": "STRING" },
+                            "calories": { "type": "NUMBER" },
+                            "protein": { "type": "NUMBER" },
+                            "carbs": { "type": "NUMBER" },
+                            "fat": { "type": "NUMBER" },
+                            "confidence": { "type": "STRING" }
+                        },
+                        required: ["mealName", "calories", "protein", "carbs", "fat"]
+                    }
+                }
+            };
+
+            const apiUrl = `${API_URL_BASE}${MODEL}:generateContent?key=${apiKey}`;
+
+            try {
+                const response = await exponentialBackoffFetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                if (jsonText) {
+                    const parsedJson = cleanAndParseJSON(jsonText);
+                    if (parsedJson) {
+                        state.visionResult = parsedJson;
+                        updateUI();
+                    } else {
+                        showModal('Parsing Error', 'The AI response was malformed. Please try again.');
+                    }
+                } else {
+                    console.error("API Response Error:", result);
+                    showModal('API Error', 'Could not analyze the image. The model returned an invalid or empty response.');
+                }
+
+            } catch (error) {
+                console.error("Vision Analysis Error:", error);
+                let errorMessage = (error.message && error.message.includes('401'))
+                    ? 'Unauthorized: The AI feature is currently disabled due to an API key issue.'
+                    : `Error analyzing image: ${error.message}.`;
+                showModal('Request Failed', errorMessage);
+            } finally {
+                if (loadingIndicator) loadingIndicator.classList.add('hidden');
+            }
+        };
+
+        // Blood report analysis
+        const analyzeBloodReport = async (reportText) => {
+            const loadingIndicator = document.getElementById('analysis-loading');
+            if (loadingIndicator) loadingIndicator.classList.remove('hidden');
+
+            const profile = state.userData.profile;
+            const profileDetails = profile ? `User Region: ${profile.region}. Chronic Diseases: ${profile.diseases || 'None'}. Medications: ${profile.medications || 'None'}.` : 'No profile data.';
+
+            const systemPrompt = "You are a specialized Medical Nutrition AI. Analyze the provided blood report text and user profile. Identify potential nutrient deficiencies or high/low markers that are nutritionally relevant. Provide specific food/supplement recommendations to address them. Use your general medical knowledge to provide advice. Return ONLY the requested JSON structure.";
+
+            const userQuery = `${systemPrompt}\n\nAnalyze the following blood report or medical notes: "${reportText}". Based on this and the user profile (${profileDetails}), identify key nutritional deficiencies (e.g., Iron, Vitamin D, high LDL) and suggest concrete steps.`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    maxOutputTokens: 2000, 
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            "summary": { "type": "STRING" },
+                            "deficiencies": {
+                                "type": "ARRAY",
+                                "items": {
+                                    type: "OBJECT",
+                                    properties: {
+                                        "nutrient": { "type": "STRING" },
+                                        "status": { "type": "STRING" },
+                                        "suggestion": { "type": "STRING" }
+                                    },
+                                    required: ["nutrient", "status", "suggestion"]
+                                }
+                            },
+                        },
+                        required: ["summary", "deficiencies"]
+                    }
+                }
+            };
+
+            const apiUrl = `${API_URL_BASE}${MODEL}:generateContent?key=${apiKey}`;
+
+            try {
+                const response = await exponentialBackoffFetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                if (jsonText) {
+                    const parsedJson = cleanAndParseJSON(jsonText);
+                    
+                    if (parsedJson) {
+                        state.userData.deficiencyAnalysis = { ...parsedJson, sources: [] }; 
+                        await saveUserData({ deficiencyAnalysis: state.userData.deficiencyAnalysis });
+                        updateUI();
+                    } else {
+                        showModal('Parsing Error', 'Failed to parse the AI analysis. Please try simpler text.');
+                    }
+                } else {
+                    console.error("Analysis API Response Error:", result);
+                    showModal('API Error', 'Could not complete the analysis. Invalid response received.');
+                }
+
+            } catch (error) {
+                console.error("Analysis Error:", error);
+                let errorMessage = (error.message && error.message.includes('401'))
+                    ? 'Unauthorized: The AI feature is currently disabled due to an API key issue.'
+                    : `Error performing analysis: ${error.message}.`;
+                showModal('Request Failed', errorMessage);
+            } finally {
+                if (loadingIndicator) loadingIndicator.classList.add('hidden');
+            }
+        };
+
+        // Meal Planner Function (UPDATED WITH PREP SCHEDULE)
+        const generateMealPlan = async (ingredients, condition, weather) => {
+            const loadingIndicator = document.getElementById('planner-loading');
+            if (loadingIndicator) loadingIndicator.classList.remove('hidden');
+
+            const profile = state.userData.profile;
+            const routine = state.userData.routine || {};
+            
+            const profileDetails = profile 
+                ? `Diet Type: ${profile.region}, Allergies/Diseases: ${profile.diseases || 'None'}, Calorie Goal: ${profile.calorieGoal}` 
+                : 'No specific profile data, assume standard 2000kcal healthy diet.';
+
+            const routineDetails = `
+                Meal Times: Breakfast: ${routine.breakfastTime || '8:00 AM'}, Lunch: ${routine.lunchTime || '1:00 PM'}, Dinner: ${routine.dinnerTime || '8:00 PM'}.
+                Work Hours: ${routine.workStartTime || '9:00 AM'} to ${routine.workEndTime || '5:00 PM'}.
+            `;
+
+            const systemPrompt = `You are an expert Chef and Nutritionist. 
+            
+            Task 1: Create a one-day meal plan (Breakfast, Lunch, Dinner, Snack) using the available ingredients.
+            
+            Task 2: Create a 'Prep Schedule' (backwards plan) based on the User's Daily Routine. 
+            - Look at the planned Dinner time. If dinner is at 8:00 PM and needs 1 hour marination, schedule 'Put chicken in marinade' at 7:00 PM (or before work if needed).
+            - Look at Lunch time. If lunch is at 1:00 PM, when should prep start?
+            - Suggest specific times for these actions.
+            
+            Context:
+            1. User Profile: ${profileDetails}
+            2. Daily Routine: ${routineDetails}
+            3. Available Ingredients: ${ingredients}
+            4. Condition: ${condition}, Weather: ${weather}
+            
+            Return ONLY valid JSON formatted exactly as follows:
+            \`\`\`json
+            {
+                "summary": "Brief advice based on weather/health",
+                "meals": [
+                    { "type": "Breakfast", "name": "Name", "description": "Short desc", "calories": 0, "ingredientsUsed": ["item1"] },
+                    { "type": "Lunch", "name": "Name", "description": "Short desc", "calories": 0, "ingredientsUsed": ["item1"] },
+                    { "type": "Snack", "name": "Name", "description": "Short desc", "calories": 0, "ingredientsUsed": ["item1"] },
+                    { "type": "Dinner", "name": "Name", "description": "Short desc", "calories": 0, "ingredientsUsed": ["item1"] }
+                ],
+                "prepSchedule": [
+                    { "time": "07:30", "task": "Start boiling eggs for breakfast" },
+                    { "time": "18:00", "task": "Marinate chicken for dinner (right after work)" }
+                ]
+            }
+            \`\`\``;
+
+            const payload = {
+                contents: [{ parts: [{ text: systemPrompt }] }]
+            };
+
+            const apiUrl = `${API_URL_BASE}${MODEL}:generateContent?key=${apiKey}`;
+
+            try {
+                const response = await exponentialBackoffFetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                if (jsonText) {
+                    const parsedJson = cleanAndParseJSON(jsonText);
+                    if (parsedJson && Array.isArray(parsedJson.meals)) {
+                        state.mealPlan = parsedJson;
+                        updateUI();
+                    } else {
+                        console.error("Invalid JSON structure received:", parsedJson);
+                        showModal('Parsing Error', 'The AI returned an invalid meal plan structure. Please try again.');
+                    }
+                } else {
+                    showModal('API Error', 'Could not generate meal plan. No response text.');
+                }
+            } catch (error) {
+                console.error("Meal Plan Error:", error);
+                showModal('Error', 'Failed to generate plan. ' + error.message);
+            } finally {
+                if (loadingIndicator) loadingIndicator.classList.add('hidden');
+            }
+        };
+
+        // Chatbot
+        const sendChatMessage = async (message) => {
+            const chatBox = document.getElementById('chat-messages');
+            const chatInput = document.getElementById('chat-input');
+            const chatSendBtn = document.getElementById('chat-send-btn');
+
+            state.chatHistory.push({ role: 'user', text: message });
+            state.isChatLoading = true; // Set loading state
+            updateUI();
+            
+            if (chatBox) chatBox.scrollTop = chatBox.scrollHeight;
+
+            if (chatInput) chatInput.value = '';
+            if (chatSendBtn) {
+                chatSendBtn.disabled = true;
+                chatSendBtn.innerHTML = `<svg class="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" class="opacity-25"></circle><path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>`;
+            }
+
+            const profile = state.userData.profile;
+            const profileDetails = profile ? `User Goal: ${profile.calorieGoal} kcal, Diet: ${profile.region}, Diseases: ${profile.diseases || 'None'}.` : 'No profile data.';
+
+            const systemPrompt = `You are NutriSense AI Coach, a supportive and professional virtual nutritionist. Use Google Search grounding for accurate facts. Answer the user's questions concisely using Markdown formatting (lists, bold text, etc.). Incorporate the user's profile context if relevant. Current User Profile Context: ${profileDetails}`;
+
+            const conversation = state.chatHistory.map(msg => ({
+                role: msg.role === 'user' ? 'user' : 'model',
+                parts: [{ text: msg.text }]
+            }));
+
+            const payload = {
+                contents: conversation,
+                tools: [{ "google_search": {} }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+            };
+
+            const apiUrl = `${API_URL_BASE}${MODEL}:generateContent?key=${apiKey}`;
+
+            try {
+                const response = await exponentialBackoffFetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const modelText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                if (modelText) {
+                    let sources = [];
+                    const groundingMetadata = result.candidates[0].groundingMetadata;
+                    if (groundingMetadata && groundingMetadata.groundingAttributions) {
+                        sources = groundingMetadata.groundingAttributions
+                            .map(attr => ({ uri: attr.web?.uri, title: attr.web?.title }))
+                            .filter(source => source.uri && source.title);
+                    }
+
+                    const citationHtml = sources.length > 0
+                        ? `\n\n**Citations:**\n` + sources.map(s => `- [${s.title}](${s.uri})`).join('\n')
+                        : '';
+
+                    const fullResponse = modelText + citationHtml;
+
+                    state.chatHistory.push({ role: 'model', text: fullResponse });
+                } else {
+                    state.chatHistory.push({ role: 'model', text: 'Sorry, I ran into an issue getting a response. Please try again.' });
+                }
+
+            } catch (error) {
+                console.error("Chatbot Error:", error);
+                const errorText = (error.message && error.message.includes('401'))
+                    ? 'Unauthorized: The AI features are currently unavailable.'
+                    : `Connection error: ${error.message}.`;
+                state.chatHistory.push({ role: 'model', text: errorText });
+            } finally {
+                state.isChatLoading = false; // Reset loading state
+                if (chatSendBtn) {
+                    chatSendBtn.disabled = false;
+                    chatSendBtn.innerHTML = `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>`;
+                }
+                updateUI();
+                if (chatBox) chatBox.scrollTop = chatBox.scrollHeight;
+            }
+        };
+
+        // UI rendering/navigation
+        const navigate = (view) => {
+            state.currentView = view;
+            updateUI();
+        };
+
+        const updateUI = () => {
+            document.querySelectorAll('#main-nav button').forEach(btn => {
+                const isCurrent = btn.getAttribute('data-view') === state.currentView;
+                btn.classList.toggle('bg-teal-600', isCurrent);
+                btn.classList.toggle('text-white', isCurrent);
+                // FIX: Visibility for inactive buttons in dark sidebar
+                btn.classList.toggle('text-gray-300', !isCurrent); 
+                btn.classList.toggle('hover:bg-gray-700', !isCurrent); 
+                btn.classList.toggle('hover:text-white', !isCurrent);
+            });
+
+            const mainContent = document.getElementById('main-content');
+            if (!mainContent) return;
+            mainContent.innerHTML = '';
+
+            // Update connectivity status
+            const statusElement = document.getElementById('connectivity-status');
+            if (statusElement) {
+                if (useLocalStorage) {
+                    statusElement.innerHTML = `<span class="text-yellow-600 font-semibold">Offline Mode (Local Storage)</span>`;
+                } else if (isAuthReady) {
+                    statusElement.innerHTML = `<span class="text-green-600 font-semibold">Cloud Connected</span>`;
+                } else {
+                    statusElement.innerHTML = `<span class="text-red-600 font-semibold">Connecting...</span>`;
+                }
+            }
+
+
+            switch (state.currentView) {
+                case 'profile':
+                    mainContent.innerHTML = renderProfile();
+                    attachProfileListeners();
+                    break;
+                case 'vision':
+                    mainContent.innerHTML = renderVisionLog();
+                    attachVisionListeners();
+                    break;
+                case 'analysis':
+                    mainContent.innerHTML = renderAnalysis();
+                    attachAnalysisListeners();
+                    break;
+                case 'planner':
+                    mainContent.innerHTML = renderPlanner();
+                    attachPlannerListeners();
+                    break;
+                case 'chatbot':
+                    mainContent.innerHTML = renderChatbot();
+                    attachChatbotListeners();
+                    break;
+                case 'reminders':
+                    mainContent.innerHTML = renderReminders();
+                    attachReminderListeners();
+                    break;
+                case 'routine': // NEW VIEW CASE
+                    mainContent.innerHTML = renderRoutine();
+                    document.getElementById('routine-form')?.addEventListener('submit', (e) => {
+                        e.preventDefault();
+                        const form = e.target;
+                        const routineData = {
+                            wakeTime: form.wakeTime.value,
+                            sleepTime: form.sleepTime.value,
+                            breakfastTime: form.breakfastTime.value,
+                            lunchTime: form.lunchTime.value,
+                            dinnerTime: form.dinnerTime.value,
+                            exerciseTime: form.exerciseTime.value,
+                            workStartTime: form.workStartTime.value,
+                            workEndTime: form.workEndTime.value,
+                            extraActivities: form.extraActivities.value,
+                        };
+                        saveRoutine(routineData);
+                    });
+                    break;
+                case 'handoff':
+                    mainContent.innerHTML = renderHandoff();
+                    break;
+                default:
+                    mainContent.innerHTML = renderProfile();
+                    attachProfileListeners();
+            }
+        };
+
+        // --- RENDER FUNCTIONS (RESTORED MISSING HELPERS) ---
+
+        // RESTORED HELPER FUNCTION 1
+        const renderInputField = (label, id, type, value, placeholder, extra = '') => `
+            <div class="space-y-1">
+                <label for="${id}" class="block text-sm font-semibold text-gray-700">${label}</label>
+                <input type="${type}" id="${id}" name="${id}" value="${value}" placeholder="${placeholder}" ${extra}
+                    class="w-full border border-gray-300 rounded-lg p-3 focus:ring-teal-500 focus:border-teal-500 transition duration-150" required>
+            </div>
+        `;
+
+        // RESTORED HELPER FUNCTION 2
+        const renderTextareaField = (label, id, value, placeholder) => `
+            <div class="space-y-1">
+                <label for="${id}" class="block text-sm font-semibold text-gray-700">${label}</label>
+                <textarea id="${id}" name="${id}" rows="3" placeholder="${placeholder}"
+                    class="w-full border border-gray-300 rounded-lg p-3 focus:ring-teal-500 focus:border-teal-500 transition duration-150">${value}</textarea>
+            </div>
+        `;
+
+        // RESTORED HELPER FUNCTION 3
+        const renderSelectField = (label, id, selectedValue, options) => `
+            <div class="space-y-1">
+                <label for="${id}" class="block text-sm font-semibold text-gray-700">${label}</label>
+                <select id="${id}" name="${id}" class="w-full border border-gray-300 rounded-lg p-3 focus:ring-teal-500 focus:border-teal-500 transition duration-150">
+                    ${options.map(option => `<option value="${option}" ${selectedValue === option ? 'selected' : ''}>${option}</option>`).join('')}
+                </select>
+            </div>
+        `;
+
+        // RESTORED HELPER FUNCTION 4 (CRITICAL FOR BLANK SCREEN FIX)
+        const renderMacroBox = (label, value, color, weight = 'semibold', size = 'text-xl') => `
+            <div class="p-3 bg-${color}-50 rounded-lg shadow-sm">
+                <p class="text-xs text-gray-600 font-medium">${label}</p>
+                <p class="${size} font-${weight} text-${color}-700">${value}</p>
+            </div>
+        `;
+
+        const renderProfile = () => {
+            const profile = state.userData.profile || {};
+            const TDEE = profile.TDEE || 'N/A';
+            const calorieGoal = profile.calorieGoal || 'N/A';
+            const hasProfile = profile.age && profile.weightKg;
+
+            return `
+                <div class="p-6 animate-fade-in">
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6 flex items-center"><svg class="w-7 h-7 mr-3 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg> My Profile & Goals</h2>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                        <div class="content-card p-4 rounded-lg shadow-md">
+                            <h3 class="text-lg font-semibold text-teal-600 mb-1">Maintenance TDEE</h3>
+                            <p class="text-4xl font-extrabold text-gray-900">${TDEE} <span class="text-xl text-gray-500">kcal/day</span></p>
+                            <p class="text-sm text-gray-500">Total Daily Energy Expenditure.</p>
+                        </div>
+                        <div class="content-card p-4 rounded-lg shadow-md">
+                            <h3 class="text-lg font-semibold text-teal-600 mb-1">Weight Loss Goal</h3>
+                            <p class="text-4xl font-extrabold text-gray-900">${calorieGoal} <span class="text-xl text-gray-500">kcal/day</span></p>
+                            <p class="text-sm text-gray-500">Recommended deficit (-500 kcal).</p>
+                        </div>
+                        <div class="content-card p-4 rounded-lg shadow-md">
+                            <h3 class="text-lg font-semibold text-teal-600 mb-1">Logged Meals (7 days)</h3>
+                            <p class="text-4xl font-extrabold text-gray-900">${state.userData.mealLog.length} <span class="text-xl text-gray-500">meals</span></p>
+                            <p class="text-sm text-gray-500">Total meals tracked for analysis.</p>
+                        </div>
+                    </div>
+
+                    <div class="content-card p-6 rounded-lg shadow-lg">
+                        <form id="profile-form">
+                            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Age (years)</label>
+                                    <input type="number" id="age" value="${profile.age || ''}" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm p-2" min="10" max="120" />
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Weight (kg)</label>
+                                    <input type="number" id="weightKg" value="${profile.weightKg || ''}" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm p-2" min="30" max="300" step="0.1" />
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Height (cm)</label>
+                                    <input type="number" id="heightCm" value="${profile.heightCm || ''}" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm p-2" min="100" max="250" />
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Gender</label>
+                                    <select id="gender" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm p-2">
+                                        <option value="">Select...</option>
+                                        <option value="Male" ${profile.gender === 'Male' ? 'selected' : ''}>Male</option>
+                                        <option value="Female" ${profile.gender === 'Female' ? 'selected' : ''}>Female</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Diet/Region (e.g., Vegan, Mediterranean, South Asian)</label>
+                                    <input type="text" id="region" value="${profile.region || ''}" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm p-2" placeholder="e.g., Keto" />
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Chronic Diseases / Allergies (e.g., Diabetes, Celiac)</label>
+                                    <input type="text" id="diseases" value="${profile.diseases || ''}" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm p-2" placeholder="e.g., Lactose Intolerant" />
+                                </div>
+                            </div>
+                            
+                            <div class="mt-6">
+                                <label class="block text-sm font-medium text-gray-700">Medications/Supplements (optional)</label>
+                                <textarea id="medications" rows="2" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm p-2" placeholder="e.g., Metformin, Omega-3s">${profile.medications || ''}</textarea>
+                            </div>
+
+                            <div class="mt-6">
+                                <button type="submit" class="w-full inline-flex justify-center py-3 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-teal-600 hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 transition duration-150 ease-in-out">
+                                    Save Profile & Recalculate AI Goals
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderRoutine = () => {
+            const r = state.userData.routine || {};
+            return `
+                <div class="max-w-4xl mx-auto animate-fade-in p-6">
+                    <h2 class="text-3xl font-extrabold text-gray-800 mb-6 border-b pb-2 flex items-center"><svg class="w-7 h-7 mr-3 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>Daily Routine & Schedule</h2>
+                    <p class="text-gray-600 mb-6">Log your daily schedule to help the AI tailor meal timing and energy distribution better.</p>
+
+                    <form id="routine-form" class="content-card p-6 rounded-xl shadow-2xl space-y-6">
+                        
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <h3 class="font-bold text-teal-700 mb-3 border-b border-teal-100 pb-1">Sleep Cycle</h3>
+                                <div class="space-y-3">
+                                    ${renderInputField('Wake Up Time', 'wakeTime', 'time', r.wakeTime, '')}
+                                    ${renderInputField('Bedtime', 'sleepTime', 'time', r.sleepTime, '')}
+                                </div>
+                            </div>
+                            <div>
+                                <h3 class="font-bold text-teal-700 mb-3 border-b border-teal-100 pb-1">Work / School</h3>
+                                <div class="space-y-3">
+                                    ${renderInputField('Start Time', 'workStartTime', 'time', r.workStartTime, '')}
+                                    ${renderInputField('End Time', 'workEndTime', 'time', r.workEndTime, '')}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div>
+                            <h3 class="font-bold text-indigo-700 mb-3 border-b border-indigo-100 pb-1">Meal Schedule</h3>
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                ${renderInputField('Breakfast', 'breakfastTime', 'time', r.breakfastTime, '')}
+                                ${renderInputField('Lunch', 'lunchTime', 'time', r.lunchTime, '')}
+                                ${renderInputField('Dinner', 'dinnerTime', 'time', r.dinnerTime, '')}
+                            </div>
+                        </div>
+
+                        <div>
+                            <h3 class="font-bold text-red-700 mb-3 border-b border-red-100 pb-1">Activity</h3>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                ${renderInputField('Exercise Time (Optional)', 'exerciseTime', 'time', r.exerciseTime, '')}
+                            </div>
+                        </div>
+
+                        ${renderTextareaField('Additional Activities / Routine Notes', 'extraActivities', r.extraActivities, 'e.g., 10:00 AM - Coffee break, 3:00 PM - Pick up kids, Weekly Yoga on Tuesdays...')}
+
+                        <button type="submit" class="w-full bg-teal-600 hover:bg-teal-700 text-white font-semibold py-3 px-4 rounded-lg transition duration-150 shadow-md transform hover:scale-[1.01]">
+                            Save Routine
+                        </button>
+                    </form>
+                </div>
+            `;
+        };
+
+        const renderVisionLog = () => {
+            const result = state.visionResult;
+
+            const mealLogHtml = state.userData.mealLog.slice().reverse().map(meal => `
+                <li class="bg-white p-4 rounded-lg shadow-sm mb-2 border-l-4 border-teal-400">
+                    <p class="text-sm font-semibold">${new Date(meal.date).toLocaleDateString()} @ ${new Date(meal.date).toLocaleTimeString()}</p>
+                    <p class="text-lg font-bold text-gray-800">${meal.mealName}</p>
+                    <div class="text-sm text-gray-600 mt-1">
+                        <span class="font-medium text-teal-600">${meal.calories} kcal</span> |
+                        Protein: ${meal.protein}g, Carbs: ${meal.carbs}g, Fat: ${meal.fat}g
+                    </div>
+                </li>
+            `).join('');
+
+            return `
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 p-6 animate-fade-in">
+                    <div class="lg:col-span-2">
+                        <h2 class="text-3xl font-bold text-gray-800 mb-6 flex items-center"><svg class="w-7 h-7 mr-3 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h14a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7V4m-6 3V4"></path></svg> AI Meal Vision Logger</h2>
+                        
+                        <div class="content-card p-6 rounded-lg shadow-lg mb-6">
+                            <form id="vision-form">
+                                <div id="drop-area" class="file-upload-box rounded-lg p-6 text-center cursor-pointer">
+                                    <input type="file" id="meal-image" accept="image/*" class="hidden" required/>
+                                    <p class="text-teal-600 font-semibold mb-1"><svg class="w-6 h-6 inline-block mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-12 5h12a2 2 0 002-2V7a2 2 0 00-2-2H6a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg> Upload Meal Photo (Click or Drag & Drop)</p>
+                                    <p class="text-xs text-gray-500" id="file-name">No file selected.</p>
+                                </div>
+
+                                <div class="mt-4">
+                                    <label class="block text-sm font-medium text-gray-700">Meal Description (e.g., "Chicken breast with rice and salad")</label>
+                                    <input type="text" id="meal-description" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2" required placeholder="Describe the meal for better accuracy" />
+                                </div>
+
+                                <div class="mt-6">
+                                    <button type="submit" id="analyze-btn" class="w-full inline-flex justify-center py-3 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-teal-600 hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 transition duration-150 ease-in-out">
+                                        Analyze & Estimate Macros
+                                    </button>
+                                    <div id="vision-loading" class="hidden text-center mt-2 text-teal-600">
+                                        <svg class="animate-spin h-5 w-5 mr-3 inline-block" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" class="opacity-25"></circle><path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                        Analyzing meal...
+                                    </div>
+                                </div>
+                            </form>
+                        </div>
+
+                        ${result ? `
+                            <div id="vision-output" class="content-card p-6 rounded-lg shadow-lg animate-fade-in">
+                                <h3 class="text-xl font-bold text-green-700 mb-4 flex items-center"><svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> AI Analysis: ${result.mealName}</h3>
+                                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+                                    ${renderMacroBox('Calories', Math.round(result.calories), 'teal')}
+                                    ${renderMacroBox('Protein (g)', Math.round(result.protein), 'red')}
+                                    ${renderMacroBox('Carbs (g)', Math.round(result.carbs), 'yellow')}
+                                    ${renderMacroBox('Fat (g)', Math.round(result.fat), 'blue')}
+                                </div>
+                                <p class="mt-4 text-sm text-gray-600 border-t pt-4">Confidence: ${result.confidence || 'High'}</p>
+
+                                <button id="log-meal-btn" class="w-full mt-4 inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition duration-150 ease-in-out">
+                                    Log Meal
+                                </button>
+                            </div>
+                        ` : ''}
+
+                    </div>
+                    <div class="lg:col-span-1">
+                        <h3 class="text-2xl font-bold text-gray-800 mb-4 flex items-center"><svg class="w-6 h-6 mr-2 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg> Recent Logged Meals</h3>
+                        <ul class="scroll-container bg-gray-50 p-3 rounded-lg shadow-inner border max-h-[70vh]">
+                            ${mealLogHtml.length > 0 ? mealLogHtml : '<li class="text-gray-500 italic p-3">No meals logged yet.</li>'}
+                        </ul>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderAnalysis = () => {
+            const analysis = state.userData.deficiencyAnalysis;
+
+            let analysisHtml = '';
+            if (analysis) {
+                const deficienciesHtml = analysis.deficiencies.map(def => `
+                    <div class="border-l-4 p-4 mb-3 rounded-lg ${def.status === 'High' ? 'border-red-500 bg-red-50' : 'border-orange-500 bg-orange-50'}">
+                        <p class="font-bold text-lg">${def.nutrient} - <span class="${def.status === 'High' ? 'text-red-700' : 'text-orange-700'}">${def.status}</span></p>
+                        <p class="text-sm text-gray-700 mt-1">${def.suggestion}</p>
+                    </div>
+                `).join('');
+
+                analysisHtml = `
+                    <div class="content-card p-6 rounded-lg shadow-lg animate-fade-in">
+                        <h3 class="text-xl font-bold text-teal-700 mb-4 flex items-center"><svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-4 0h6m-6 0v-5a2 2 0 012-2h2a2 2 0 012 2v5m-4 0v-2h2v2"></path></svg> AI Report Summary</h3>
+                        <p class="text-gray-700 mb-6">${analysis.summary}</p>
+                        
+                        <h4 class="text-lg font-bold text-gray-700 mb-3">Identified Nutritional Markers & Suggestions:</h4>
+                        <div class="space-y-4">
+                            ${deficienciesHtml}
+                        </div>
+                        <p class="mt-6 text-sm italic text-gray-500">Disclaimer: This is an AI analysis for informational purposes. Consult a doctor for medical advice.</p>
+                    </div>
+                `;
+            }
+
+            return `
+                <div class="p-6 animate-fade-in">
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6 flex items-center"><svg class="w-7 h-7 mr-3 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 13v-1m4 1v-1m4 1v-1M8 21v-3m4 3v-3m4 3v-3m2 8H6a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v12a2 2 0 01-2 2z"></path></svg> Blood/Health Report Analysis</h2>
+                    
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div class="content-card p-6 rounded-lg shadow-lg">
+                            <form id="analysis-form">
+                                <label for="report-text" class="block text-sm font-medium text-gray-700 mb-2">Paste Blood Report or Medical Notes Text</label>
+                                <textarea id="report-text" rows="8" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm p-2" required placeholder="e.g., Vitamin D: 18 ng/mL (Low), LDL Cholesterol: 140 mg/dL (High), Iron: 50 ug/dL (Normal)">${analysis ? 'Previous analysis text is hidden for privacy.' : ''}</textarea>
+                                
+                                <div class="mt-6">
+                                    <button type="submit" id="analyze-report-btn" class="w-full inline-flex justify-center py-3 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-teal-600 hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 transition duration-150 ease-in-out">
+                                        Run AI Deficiency Analysis
+                                    </button>
+                                    <div id="analysis-loading" class="hidden text-center mt-2 text-teal-600">
+                                        <svg class="animate-spin h-5 w-5 mr-3 inline-block" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" class="opacity-25"></circle><path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                        Analyzing report...
+                                    </div>
+                                </div>
+                            </form>
+                        </div>
+                        
+                        <div>
+                            ${analysisHtml || '<div class="content-card p-6 rounded-lg shadow-lg text-gray-500 italic flex items-center justify-center h-full">Run an analysis to see your nutritional report here.</div>'}
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderPlanner = () => {
+            const plan = state.mealPlan;
+            const profile = state.userData.profile;
+
+            let planHtml = '';
+            if (plan && Array.isArray(plan.meals)) {
+                const mealsHtml = plan.meals.map(meal => `
+                    <div class="border-l-4 border-teal-500 p-4 rounded-lg bg-teal-50 mb-4">
+                        <p class="text-xs font-semibold text-teal-600">${meal.type.toUpperCase()}</p>
+                        <p class="font-bold text-lg text-gray-800">${meal.name} <span class="text-sm font-medium text-gray-600">(${Math.round(meal.calories)} kcal)</span></p>
+                        <p class="text-sm text-gray-700 mt-1">${meal.description}</p>
+                        <p class="text-xs text-gray-500 mt-2">Ingredients Used: ${meal.ingredientsUsed.join(', ')}</p>
+                    </div>
+                `).join('');
+
+                // NEW: Prep Timeline Rendering
+                let prepHtml = '';
+                if (plan.prepSchedule && Array.isArray(plan.prepSchedule) && plan.prepSchedule.length > 0) {
+                    const sortedPrep = plan.prepSchedule.sort((a, b) => a.time.localeCompare(b.time));
+                    
+                    prepHtml = `
+                        <div class="mt-8 pt-6 border-t border-gray-200">
+                            <h3 class="text-xl font-bold text-indigo-700 mb-4 flex items-center">
+                                <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                Smart Prep Timeline
+                            </h3>
+                            <div class="relative pl-6 border-l-2 border-indigo-200 space-y-6">
+                                ${sortedPrep.map(item => `
+                                    <div class="relative">
+                                        <div class="absolute -left-[33px] top-1 h-4 w-4 rounded-full bg-indigo-500 border-4 border-white shadow"></div>
+                                        <div class="flex flex-col sm:flex-row sm:items-baseline">
+                                            <span class="font-bold text-indigo-900 w-20 flex-shrink-0">${item.time}</span>
+                                            <span class="text-gray-700">${item.task}</span>
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                }
+
+                planHtml = `
+                    <div class="content-card p-6 rounded-lg shadow-lg animate-fade-in">
+                        <h3 class="text-xl font-bold text-green-700 mb-4 flex items-center"><svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg> AI Daily Meal Plan</h3>
+                        <div class="bg-blue-50 border-l-4 border-blue-400 p-3 rounded-md mb-6">
+                            <p class="text-sm font-medium text-blue-700">${plan.summary}</p>
+                        </div>
+                        <div class="space-y-4">
+                            ${mealsHtml}
+                        </div>
+                        ${prepHtml}
+                    </div>
+                `;
+            }
+
+            return `
+                <div class="p-6 animate-fade-in">
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6 flex items-center"><svg class="w-7 h-7 mr-3 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> AI Daily Meal Planner</h2>
+                    
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div class="content-card p-6 rounded-lg shadow-lg">
+                            <h3 class="text-xl font-bold text-gray-700 mb-4">Planning Input:</h3>
+                            <form id="planner-form">
+                                <p class="text-xs text-gray-500 mb-4 border-b pb-2">Your current goal: ${profile ? `${profile.calorieGoal} kcal/day` : 'Standard 2000 kcal'}</p>
+
+                                <div class="mb-4">
+                                    <label class="block text-sm font-medium text-gray-700">Available Ingredients (comma-separated)</label>
+                                    <input type="text" id="ingredients" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2" required placeholder="e.g., chicken, broccoli, rice, eggs" />
+                                </div>
+                                <div class="mb-4">
+                                    <label class="block text-sm font-medium text-gray-700">Health Condition Today</label>
+                                    <input type="text" id="condition" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2" placeholder="e.g., Feeling a little cold, need comfort food" />
+                                </div>
+                                <div class="mb-6">
+                                    <label class="block text-sm font-medium text-gray-700">Weather Today</label>
+                                    <input type="text" id="weather" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2" placeholder="e.g., Cold and rainy, Hot and sunny" />
+                                </div>
+
+                                <button type="submit" class="w-full inline-flex justify-center py-3 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-teal-600 hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 transition duration-150 ease-in-out">
+                                    Generate 1-Day Meal Plan
+                                </button>
+                                <div id="planner-loading" class="hidden text-center mt-2 text-teal-600">
+                                    <svg class="animate-spin h-5 w-5 mr-3 inline-block" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" class="opacity-25"></circle><path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                    Generating personalized plan...
+                                </div>
+                            </form>
+                        </div>
+                        
+                        <div>
+                            ${planHtml || '<div class="content-card p-6 rounded-lg shadow-lg text-gray-500 italic flex items-center justify-center h-full">Your generated meal plan will appear here.</div>'}
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderChatbot = () => {
+            const chatMessagesHtml = state.chatHistory.map(msg => {
+                const isUser = msg.role === 'user';
+                const alignmentClass = isUser ? 'justify-end' : 'justify-start';
+                const bgClass = isUser ? 'bg-teal-600 text-white' : 'bg-white text-gray-800';
+
+                return `
+                    <div class="flex ${alignmentClass} mb-4 animate-fade-in">
+                        <div class="max-w-3/4 p-4 rounded-xl shadow-md ${bgClass} ${isUser ? 'rounded-br-none' : 'rounded-tl-none'} prose prose-sm">
+                            ${isUser ? `<p class="font-semibold mb-1">You:</p>${marked.parse(msg.text)}` : marked.parse(msg.text)}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            return `
+                <div class="p-6 h-full flex flex-col animate-fade-in">
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6 flex items-center"><svg class="w-7 h-7 mr-3 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg> AI Nutrition Coach</h2>
+                    
+                    <div id="chat-messages" class="flex-grow overflow-y-auto scroll-container p-4 bg-gray-100 rounded-lg mb-4 shadow-inner max-h-[70vh]">
+                        ${chatMessagesHtml.length > 0 ? chatMessagesHtml : '<div class="text-center text-gray-500 pt-10">Ask me anything about nutrition, diet, or your health goals!</div>'}
+                        ${state.isChatLoading ? `
+                            <div class="flex justify-start mb-4">
+                                <div class="max-w-3/4 p-4 rounded-xl shadow-md bg-white text-gray-800 rounded-tl-none flex items-center">
+                                    <svg class="animate-spin h-5 w-5 mr-3 text-teal-600" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" class="opacity-25"></circle><path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                    The coach is typing...
+                                </div>
+                            </div>
+                        ` : ''}
+                    </div>
+
+                    <div class="mt-4">
+                        <form id="chat-form" class="flex">
+                            <input type="text" id="chat-input" placeholder="Message NutriSense AI..." class="flex-grow rounded-l-lg border-t border-b border-l border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm p-3" autocomplete="off" ${state.isChatLoading ? 'disabled' : ''} />
+                            <button type="submit" id="chat-send-btn" class="inline-flex items-center justify-center px-4 py-3 border border-transparent shadow-sm text-sm font-medium rounded-r-lg text-white bg-teal-600 hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 transition duration-150 ease-in-out" ${state.isChatLoading ? 'disabled' : ''}>
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderReminders = () => {
+            // Sort reminders: Upcoming first, then completed last, all sorted by date.
+            const sortedReminders = state.userData.reminders.slice().sort((a, b) => {
+                // Prioritize incomplete over complete
+                if (a.isCompleted !== b.isCompleted) {
+                    return a.isCompleted ? 1 : -1;
+                }
+                // Sort by date (oldest first)
+                return new Date(a.date) - new Date(b.date);
+            });
+
+            const remindersHtml = sortedReminders.map(r => {
+                const isCompleted = r.isCompleted;
+                const statusBtnClass = isCompleted ? 'bg-gray-400 hover:bg-gray-500' : 'bg-green-500 hover:bg-green-600';
+                const statusBtnText = isCompleted ? 'Undo' : 'Complete';
+                const cardClass = isCompleted ? 'opacity-60 completed-reminder' : 'opacity-100';
+
+                return `
+                    <li class="content-card p-4 rounded-lg shadow-md mb-3 flex items-center justify-between transition duration-150 ease-in-out ${cardClass}">
+                        <div class="flex-grow mr-4">
+                            <p class="text-lg font-semibold">${r.title}</p>
+                            <p class="text-sm ${isCompleted ? 'text-gray-600' : 'text-teal-600'} font-medium">
+                                <svg class="w-4 h-4 inline-block mr-1 align-text-bottom" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h.01M15 11h.01M16 16h.01M9 16h.01M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                                ${new Date(r.date).toLocaleDateString()}
+                            </p>
+                            <p class="text-xs text-gray-500 mt-1">${r.note}</p>
+                        </div>
+                        <button data-id="${r.id}" class="toggle-complete-btn px-3 py-1 text-xs font-semibold text-white rounded-full ${statusBtnClass} transition duration-150 ease-in-out">
+                            ${statusBtnText}
+                        </button>
+                    </li>
+                `;
+            }).join('');
+
+            // Get tomorrow's date for default form value
+            const tomorrow = new Date();
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            const tomorrowDateString = tomorrow.toISOString().substring(0, 10);
+
+            return `
+                <div class="p-6 animate-fade-in">
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6 flex items-center"><svg class="w-7 h-7 mr-3 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> Health Reminders</h2>
+                    
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div class="content-card p-6 rounded-lg shadow-lg lg:col-span-1">
+                            <h3 class="text-xl font-bold text-gray-700 mb-4">Schedule New Reminder</h3>
+                            <form id="reminder-form">
+                                <div class="mb-4">
+                                    <label class="block text-sm font-medium text-gray-700">Title (e.g., Take Vitamin D)</label>
+                                    <input type="text" id="reminder-title" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2" required />
+                                </div>
+                                <div class="mb-4">
+                                    <label class="block text-sm font-medium text-gray-700">Date/Time</label>
+                                    <input type="datetime-local" id="reminder-date" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2" required value="${tomorrowDateString}T08:00" />
+                                </div>
+                                <div class="mb-6">
+                                    <label class="block text-sm font-medium text-gray-700">Note (Optional)</label>
+                                    <textarea id="reminder-note" rows="2" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2"></textarea>
+                                </div>
+                                <button type="submit" class="w-full inline-flex justify-center py-3 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-teal-600 hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 transition duration-150 ease-in-out">
+                                    Schedule Reminder
+                                </button>
+                            </form>
+                        </div>
+                        
+                        <div class="lg:col-span-2">
+                            <h3 class="text-2xl font-bold text-gray-800 mb-4">Upcoming Reminders (${state.userData.reminders.filter(r => !r.isCompleted).length} pending)</h3>
+                            <ul class="scroll-container bg-gray-50 p-3 rounded-lg shadow-inner border max-h-[70vh]">
+                                ${remindersHtml.length > 0 ? remindersHtml : '<li class="text-gray-500 italic p-3">No reminders scheduled yet.</li>'}
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderHandoff = () => {
+            const p = state.userData.profile;
+            const log = state.userData.mealLog;
+            const analysis = state.userData.deficiencyAnalysis;
+
+            const oneWeekAgo = new Date();
+            oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+            const recentLogs = log.filter(meal => new Date(meal.date) > oneWeekAgo);
+            const totalRecentCalories = recentLogs.reduce((acc, meal) => acc + (meal.calories || 0), 0);
+            const avgDailyCalories = recentLogs.length > 0 ? Math.round(totalRecentCalories / 7) : 0;
+
+            const logItems = [...log].reverse().slice(0, 5).map(meal => `
+                <li class="border-b py-2 text-sm">
+                    <span class="font-semibold">${meal.mealName}</span> (${meal.mealType}) - ${Math.round(meal.calories || 0)} kcal
+                    <span class="text-xs text-gray-500 block">${new Date(meal.date).toLocaleDateString()} ${new Date(meal.date).toLocaleTimeString()}</span>
+                </li>
+            `).join('');
+
+            return `
+                <div class="p-6 animate-fade-in">
+                    <h2 class="text-3xl font-extrabold text-indigo-700 mb-6 border-b pb-2">Nutritionist Handoff Summary</h2>
+                    <p class="text-gray-600 mb-6 italic">This dashboard provides a comprehensive, objective summary of the client's AI-tracked data, medical history, and personalized recommendations for professional review (Feature 5).</p>
+
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div class="lg:col-span-1 content-card p-5 rounded-xl shadow-2xl space-y-3">
+                            <h3 class="text-xl font-bold text-teal-600">Client Profile</h3>
+                            <p class="text-sm text-gray-700">Client ID: <span class="font-mono text-xs text-gray-500 break-all">${userId || 'Offline User'}</span></p>
+                            ${p ? `
+                                <p>Age: ${p.age}, Gender: ${p.gender}</p>
+                                <p>Goals: ${p.calorieGoal} kcal/day (Deficit)</p>
+                                <p>Chronic Issues: ${p.diseases || 'None reported'}</p>
+                                <p>Dietary Preference: ${p.region}</p>
+                            ` : `<p class="text-red-500">Profile data incomplete.</p>`}
+                        </div>
+
+                        <div class="lg:col-span-2 content-card p-5 rounded-xl shadow-2xl">
+                            <h3 class="text-xl font-bold text-teal-600 mb-3">Performance & Compliance</h3>
+                            <div class="grid grid-cols-2 gap-4">
+                                ${renderMacroBox('Goal Calorie', (p?.calorieGoal || 'N/A') + ' kcal', 'indigo', 'extrabold', 'text-sm')}
+                                ${renderMacroBox('Avg Daily Intake (7D)', avgDailyCalories + ' kcal', 'teal', 'extrabold', 'text-sm')}
+                                ${renderMacroBox('Meals Tracked (Total)', log.length, 'gray', 'extrabold', 'text-sm')}
+                                ${renderMacroBox('Compliance Score', (recentLogs.length > 0 ? 'High' : 'Low'), recentLogs.length > 0 ? 'green' : 'red', 'extrabold', 'text-sm')}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="content-card p-5 rounded-xl shadow-2xl mt-6">
+                        <h3 class="text-xl font-bold text-indigo-600 mb-3 border-b pb-2">AI Medical Summary</h3>
+                        ${analysis ? `
+                            <p class="italic text-gray-700 mb-4">${analysis.summary}</p>
+                            <ul class="list-disc list-inside space-y-2">
+                                ${analysis.deficiencies.map(def => `
+                                    <li><span class="font-bold text-red-600">${def.nutrient} (${def.status}):</span> ${def.suggestion}</li>
+                                `).join('')}
+                            </ul>
+                        ` : `<p class="text-gray-500">No AI Deficiency Analysis performed yet.</p>`}
+                    </div>
+
+                    <div class="content-card p-5 rounded-xl shadow-2xl mt-6">
+                        <h3 class="text-xl font-bold text-indigo-600 mb-3 border-b pb-2">Recent Meal Logs</h3>
+                        <ul class="divide-y divide-gray-100">
+                            ${logItems || '<p class="text-gray-500">No meals logged recently.</p>'}
+                        </ul>
+                    </div>
+                </div>
+            `;
+        };
+
+        // --- ATTACH LISTENERS ---
+
+        const attachProfileListeners = () => {
+            document.getElementById('profile-form')?.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const profileData = {
+                    age: document.getElementById('age').value,
+                    weightKg: document.getElementById('weightKg').value,
+                    heightCm: document.getElementById('heightCm').value,
+                    gender: document.getElementById('gender').value,
+                    region: document.getElementById('region').value,
+                    diseases: document.getElementById('diseases').value,
+                    medications: document.getElementById('medications').value,
+                };
+                saveProfile(profileData);
+            });
+        };
+
+        const attachVisionListeners = () => {
+            const dropArea = document.getElementById('drop-area');
+            const fileInput = document.getElementById('meal-image');
+            const fileNameDisplay = document.getElementById('file-name');
+            let uploadedFile = null;
+
+            if (fileInput) {
+                fileInput.addEventListener('change', () => {
+                    uploadedFile = fileInput.files[0];
+                    if (uploadedFile) {
+                        fileNameDisplay.textContent = uploadedFile.name;
+                    } else {
+                        fileNameDisplay.textContent = 'No file selected.';
+                    }
+                });
+            }
+
+            // Drag and Drop implementation
+            if (dropArea) {
+                ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+                    dropArea.addEventListener(eventName, (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                    }, false);
+                });
+
+                ['dragenter', 'dragover'].forEach(eventName => {
+                    dropArea.addEventListener(eventName, () => {
+                        dropArea.classList.add('border-solid', 'border-teal-700');
+                    }, false);
+                });
+
+                ['dragleave', 'drop'].forEach(eventName => {
+                    dropArea.addEventListener(eventName, () => {
+                        dropArea.classList.remove('border-solid', 'border-teal-700');
+                    }, false);
+                });
+
+                dropArea.addEventListener('drop', (e) => {
+                    const dt = e.dataTransfer;
+                    uploadedFile = dt.files[0];
+                    if (uploadedFile && uploadedFile.type.startsWith('image/')) {
+                        fileInput.files = dt.files; // Assign the file to the input element
+                        fileNameDisplay.textContent = uploadedFile.name;
+                    } else {
+                        uploadedFile = null;
+                        fileNameDisplay.textContent = 'Invalid file type. Please upload an image.';
+                    }
+                }, false);
+
+                dropArea.addEventListener('click', () => fileInput.click());
+            }
+
+            document.getElementById('vision-form')?.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                if (!uploadedFile) {
+                    showModal('Error', 'Please select a meal image first.');
+                    return;
+                }
+                const description = document.getElementById('meal-description').value;
+                const base64Image = await fileToBase64(uploadedFile);
+                analyzeMealImage(base64Image, uploadedFile.type, description);
+            });
+
+            document.getElementById('log-meal-btn')?.addEventListener('click', () => {
+                const result = state.visionResult;
+                if (result) {
+                    logMeal(result);
+                    state.visionResult = null; // Clear analysis after logging
+                    updateUI();
+                }
+            });
+        };
+
+        const attachAnalysisListeners = () => {
+            document.getElementById('analysis-form')?.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const reportText = document.getElementById('report-text').value;
+                analyzeBloodReport(reportText);
+            });
+        };
+
+        const attachPlannerListeners = () => {
+            document.getElementById('planner-form')?.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const ingredients = document.getElementById('ingredients').value;
+                const condition = document.getElementById('condition').value;
+                const weather = document.getElementById('weather').value;
+                generateMealPlan(ingredients, condition, weather);
+            });
+        };
+
+        const attachChatbotListeners = () => {
+            document.getElementById('chat-form')?.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const chatInput = document.getElementById('chat-input');
+                const message = chatInput.value.trim();
+                if (message) {
+                    sendChatMessage(message);
+                }
+            });
+        };
+
+        const attachReminderListeners = () => {
+            document.getElementById('reminder-form')?.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const reminderData = {
+                    title: document.getElementById('reminder-title').value,
+                    date: document.getElementById('reminder-date').value,
+                    note: document.getElementById('reminder-note').value,
+                };
+                addReminder(reminderData);
+            });
+
+            document.querySelectorAll('.toggle-complete-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const id = parseInt(e.currentTarget.getAttribute('data-id'), 10);
+                    toggleReminderCompletion(id);
+                });
+            });
+        };
+
+        // --- MODAL UTILITY ---
+        const showModal = (title, message) => {
+            const modal = document.getElementById('app-modal');
+            const modalTitle = document.getElementById('modal-title');
+            const modalBody = document.getElementById('modal-body');
+            
+            if (modalTitle) modalTitle.textContent = title;
+            if (modalBody) modalBody.innerHTML = marked.parse(message);
+            if (modal) modal.classList.remove('hidden');
+
+            // Hide after 3 seconds for transient messages
+            if (title === 'Success' || title === 'Scheduled!') {
+                setTimeout(() => {
+                    modal.classList.add('hidden');
+                }, 3000);
+            }
+        };
+
+        const hideModal = () => {
+            document.getElementById('app-modal')?.classList.add('hidden');
+        };
+
+        // --- INITIALIZATION ---
+        window.onload = () => {
+            document.getElementById('modal-close-btn')?.addEventListener('click', hideModal);
+            document.getElementById('modal-overlay')?.addEventListener('click', hideModal);
+
+            // Attach navigation listeners
+            document.querySelectorAll('#main-nav button').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    navigate(btn.getAttribute('data-view'));
+                });
+            });
+
+            initializeFirebase();
+        };
+
+    </script>
+
+    <div class="flex h-screen bg-gray-100">
+        <div class="w-64 bg-slate-900 text-white flex flex-col shadow-2xl">
+            <div class="p-6">
+                <h1 class="text-2xl font-extrabold text-teal-400">NutriSense Pro</h1>
+                <p class="text-xs text-gray-400 mt-1">AI Health System</p>
+            </div>
+            
+            <nav id="main-nav" class="flex-grow space-y-2 p-4">
+                <button data-view="profile" class="w-full text-left flex items-center p-3 rounded-lg transition duration-150 ease-in-out bg-teal-600 text-white">
+                    <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                    My Profile & Goals
+                </button>
+                <button data-view="routine" class="w-full text-left flex items-center p-3 rounded-lg transition duration-150 ease-in-out text-gray-300 hover:bg-gray-700 hover:text-white">
+                    <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    Daily Routine
+                </button>
+                <button data-view="vision" class="w-full text-left flex items-center p-3 rounded-lg transition duration-150 ease-in-out text-gray-300 hover:bg-gray-700 hover:text-white">
+                    <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h14a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7V4m-6 3V4"></path></svg>
+                    AI Meal Vision Log
+                </button>
+                <button data-view="analysis" class="w-full text-left flex items-center p-3 rounded-lg transition duration-150 ease-in-out text-gray-300 hover:bg-gray-700 hover:text-white">
+                    <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 13v-1m4 1v-1m4 1v-1M8 21v-3m4 3v-3m4 3v-3m2 8H6a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 01-2 2z"></path></svg>
+                    Report Analysis
+                </button>
+                <button data-view="planner" class="w-full text-left flex items-center p-3 rounded-lg transition duration-150 ease-in-out text-gray-300 hover:bg-gray-700 hover:text-white">
+                    <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    AI Meal Planner
+                </button>
+                <button data-view="chatbot" class="w-full text-left flex items-center p-3 rounded-lg transition duration-150 ease-in-out text-gray-300 hover:bg-gray-700 hover:text-white">
+                    <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
+                    AI Nutrition Coach
+                </button>
+                <button data-view="reminders" class="w-full text-left flex items-center p-3 rounded-lg transition duration-150 ease-in-out text-gray-300 hover:bg-gray-700 hover:text-white">
+                    <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    Reminders
+                </button>
+                <div class="h-px bg-gray-700 my-4"></div>
+                <button data-view="handoff" class="w-full text-left flex items-center p-3 rounded-lg transition duration-150 ease-in-out text-gray-300 hover:bg-gray-700 hover:text-white">
+                    <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H5a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-5"></path></svg>
+                    Nutritionist Handoff
+                </button>
+            </nav>
+
+            <div class="p-4 border-t border-gray-700">
+                <p class="text-xs text-gray-400 mb-1">Status:</p>
+                <div id="connectivity-status" class="text-sm">Connecting...</div>
+            </div>
+        </div>
+
+        <main id="main-content" class="flex-grow overflow-y-auto scroll-container">
+            <div class="p-10 text-center text-gray-500">Loading Application...</div>
+        </main>
+    </div>
+
+    <div id="app-modal" class="fixed inset-0 z-50 overflow-y-auto hidden">
+        <div id="modal-overlay" class="fixed inset-0 bg-gray-900 bg-opacity-50 transition-opacity"></div>
+        <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+            <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full" role="dialog" aria-modal="true" aria-labelledby="modal-headline">
+                <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+                    <div class="sm:flex sm:items-start">
+                        <div class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-teal-100 sm:mx-0 sm:h-10 sm:w-10">
+                            <svg class="h-6 w-6 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        </div>
+                        <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
+                            <h3 class="text-lg leading-6 font-medium text-gray-900" id="modal-title"></h3>
+                            <div class="mt-2">
+                                <div id="modal-body" class="text-sm text-gray-500 prose"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-gray-50 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+                    <button type="button" id="modal-close-btn" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-teal-600 text-base font-medium text-white hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 sm:ml-3 sm:w-auto sm:text-sm">
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
